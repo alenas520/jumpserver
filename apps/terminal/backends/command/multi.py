@@ -9,10 +9,15 @@ class CommandStore(CommandBase):
         self.storage_list = storage_list
 
     def filter(self, **kwargs):
+        if len(self.storage_list) == 1:
+            storage = list(self.storage_list)[0]
+            queryset = storage.filter(**kwargs)
+            return queryset
+
         queryset = []
         for storage in self.storage_list:
             queryset.extend(storage.filter(**kwargs))
-        return sorted(queryset, key=lambda command: command["timestamp"], reverse=True)
+        return sorted(queryset, key=lambda command: command.timestamp, reverse=True)
 
     def count(self, **kwargs):
         amount = 0

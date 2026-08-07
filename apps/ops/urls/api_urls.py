@@ -1,20 +1,33 @@
 # ~*~ coding: utf-8 ~*~
 from __future__ import unicode_literals
 
-from django.conf.urls import url
+from django.urls import path
 from rest_framework.routers import DefaultRouter
-from .. import api
+from rest_framework_bulk.routes import BulkRouter
 
+from .. import api
 
 app_name = "ops"
 
 router = DefaultRouter()
-router.register(r'v1/tasks', api.TaskViewSet, 'task')
-router.register(r'v1/adhoc', api.AdHocViewSet, 'adhoc')
-router.register(r'v1/history', api.AdHocRunHistorySet, 'history')
+bulk_router = BulkRouter()
+
+bulk_router.register(r'adhocs', api.AdHocViewSet, 'adhoc')
+bulk_router.register(r'playbooks', api.PlaybookViewSet, 'playbook')
+bulk_router.register(r'jobs', api.JobViewSet, 'job')
+bulk_router.register(r'variables', api.VariableViewSet, 'variable')
+bulk_router.register(r'job-executions', api.JobExecutionViewSet, 'job-execution')
+router.register(r'celery/period-tasks', api.CeleryPeriodTaskViewSet, 'celery-period-task')
+
+router.register(r'tasks', api.CeleryTaskViewSet, 'task')
+router.register(r'task-executions', api.CeleryTaskExecutionViewSet, 'task-executions')
 
 urlpatterns = [
-    url(r'^v1/tasks/(?P<pk>[0-9a-zA-Z\-]{36})/run/$', api.TaskRun.as_view(), name='task-run'),
+    path('playbook/<uuid:pk>/file/', api.PlaybookFileBrowserAPIView.as_view(), name='playbook-file'),
+    path('variables/help/', api.JobRunVariableHelpAPIView.as_view(), name='variable-help'),
+    path('job-execution/task-detail/<uuid:task_id>/', api.JobExecutionTaskDetail.as_view(), name='task-detail'),
+    path('username-hints/', api.UsernameHintsAPI.as_view(), name='username-hints'),
+    path('classified-hosts/', api.ClassifiedHostsAPI.as_view(), name='classified-hosts'),
 ]
 
-urlpatterns += router.urls
+urlpatterns += (router.urls + bulk_router.urls)

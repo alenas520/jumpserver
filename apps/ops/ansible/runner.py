@@ -1,229 +1,238 @@
-# ~*~ coding: utf-8 ~*~
-
 import os
-from collections import namedtuple
+import shutil
+import uuid
 
-from ansible.executor.task_queue_manager import TaskQueueManager
-from ansible.vars.manager import VariableManager
-from ansible.parsing.dataloader import DataLoader
-from ansible.executor.playbook_executor import PlaybookExecutor
-from ansible.playbook.play import Play
-import ansible.constants as C
+from django.conf import settings
+from django.utils._os import safe_join
 
-from .callback import AdHocResultCallback, PlaybookResultCallBack, \
-    CommandResultCallback
-from common.utils import get_logger
-from .exceptions import AnsibleError
+from common.utils import is_macos
+from common.utils.yml import sanitize_ansible_inventory_json, sanitize_ansible_playbook
 
+from ..utils import get_ansible_log_verbosity
+from .callback import DefaultCallback
+from .docker import (
+    docker_extravars,
+    docker_isolation_kwargs,
+    ensure_ansible_docker_image,
+    prepare_isolated_ansible_cfg,
+    stage_inventory_for_docker,
+    use_ansible_docker_isolation,
+)
+from .exception import CommandInBlackListException
+from .interface import interface
 
-__all__ = ["AdHocRunner", "PlayBookRunner"]
-C.HOST_KEY_CHECKING = False
-logger = get_logger(__name__)
-
-
-Options = namedtuple('Options', [
-    'listtags', 'listtasks', 'listhosts', 'syntax', 'connection',
-    'module_path', 'forks', 'remote_user', 'private_key_file', 'timeout',
-    'ssh_common_args', 'ssh_extra_args', 'sftp_extra_args',
-    'scp_extra_args', 'become', 'become_method', 'become_user',
-    'verbosity', 'check', 'extra_vars', 'playbook_path', 'passwords',
-    'diff', 'gathering', 'remote_tmp',
-])
-
-
-def get_default_options():
-    options = Options(
-        listtags=False,
-        listtasks=False,
-        listhosts=False,
-        syntax=False,
-        timeout=60,
-        connection='ssh',
-        module_path='',
-        forks=10,
-        remote_user='root',
-        private_key_file=None,
-        ssh_common_args="",
-        ssh_extra_args="",
-        sftp_extra_args="",
-        scp_extra_args="",
-        become=None,
-        become_method=None,
-        become_user=None,
-        verbosity=None,
-        extra_vars=[],
-        check=False,
-        playbook_path='/etc/ansible/',
-        passwords=None,
-        diff=False,
-        gathering='implicit',
-        remote_tmp='/tmp/.ansible'
-    )
-    return options
-
-
-# Jumpserver not use playbook
-class PlayBookRunner:
-    """
-    用于执行AnsiblePlaybook的接口.简化Playbook对象的使用.
-    """
-
-    # Default results callback
-    results_callback_class = PlaybookResultCallBack
-    loader_class = DataLoader
-    variable_manager_class = VariableManager
-    options = get_default_options()
-
-    def __init__(self, inventory=None, options=None):
-        """
-        :param options: Ansible options like ansible.cfg
-        :param inventory: Ansible inventory
-        """
-        if options:
-            self.options = options
-        C.RETRY_FILES_ENABLED = False
-        self.inventory = inventory
-        self.loader = self.loader_class()
-        self.results_callback = self.results_callback_class()
-        self.playbook_path = options.playbook_path
-        self.variable_manager = self.variable_manager_class(
-            loader=self.loader, inventory=self.inventory
-        )
-        self.passwords = options.passwords
-        self.__check()
-
-    def __check(self):
-        if self.options.playbook_path is None or \
-                not os.path.exists(self.options.playbook_path):
-            raise AnsibleError(
-                "Not Found the playbook file: {}.".format(self.options.playbook_path)
-            )
-        if not self.inventory.list_hosts('all'):
-            raise AnsibleError('Inventory is empty')
-
-    def run(self):
-        executor = PlaybookExecutor(
-            playbooks=[self.playbook_path],
-            inventory=self.inventory,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-            options=self.options,
-            passwords=self.passwords
-        )
-
-        if executor._tqm:
-            executor._tqm._stdout_callback = self.results_callback
-        executor.run()
-        executor._tqm.cleanup()
-        return self.results_callback.output
+__all__ = ['AdHocRunner', 'PlaybookRunner', 'SuperPlaybookRunner', 'UploadFileRunner']
 
 
 class AdHocRunner:
-    """
-    ADHoc Runner接口
-    """
-    results_callback_class = AdHocResultCallback
-    loader_class = DataLoader
-    variable_manager_class = VariableManager
-    options = get_default_options()
-    default_options = get_default_options()
+    cmd_modules_choices = ('shell', 'raw', 'command', 'script', 'win_shell')
+    need_local_connection_modules_choices = ("mysql", "postgresql", "sqlserver", "huawei")
 
-    def __init__(self, inventory, options=None):
-        if options:
-            self.options = options
+    def __init__(self, inventory, job_module, module, module_args='', pattern='*', project_dir='/tmp/', extra_vars=None,
+                 dry_run=False, timeout=-1):
+        if extra_vars is None:
+            extra_vars = {}
+        self.id = uuid.uuid4()
         self.inventory = inventory
-        self.loader = DataLoader()
-        self.variable_manager = VariableManager(
-            loader=self.loader, inventory=self.inventory
+        self.pattern = pattern
+        self.module = module
+        self.job_module = job_module
+        self.module_args = module_args
+        self.project_dir = project_dir
+        self.cb = DefaultCallback()
+        self.runner = None
+        self.extra_vars = extra_vars
+        self.dry_run = dry_run
+        self.timeout = timeout
+        self.envs = {}
+
+    def check_module(self):
+        if self.module not in self.cmd_modules_choices:
+            return
+        command = self.module_args
+        if command and set(command.split()).intersection(set(settings.SECURITY_COMMAND_BLACKLIST)):
+            raise CommandInBlackListException(
+                "Command is rejected by black list: {}".format(self.module_args))
+
+    def set_local_connection(self):
+        if self.job_module in self.need_local_connection_modules_choices:
+            self.envs.update({"ANSIBLE_SUPER_MODE": "1"})
+
+    def run(self, verbosity=0, **kwargs):
+        self.check_module()
+        self.set_local_connection()
+        verbosity = get_ansible_log_verbosity(verbosity)
+
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, 0o755, exist_ok=True)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
+
+        prepare_isolated_ansible_cfg(self.project_dir)
+
+        run_kwargs = {
+            'timeout': self.timeout if self.timeout > 0 else None,
+            'extravars': docker_extravars(self.extra_vars),
+            'envvars': self.envs,
+            'host_pattern': self.pattern,
+            'private_data_dir': self.project_dir,
+            'inventory': self.inventory,
+            'module': self.module,
+            'module_args': self.module_args,
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            **kwargs,
+        }
+        if use_ansible_docker_isolation():
+            run_kwargs.update(docker_isolation_kwargs(self.project_dir))
+            ensure_ansible_docker_image()
+        interface.run(**run_kwargs)
+        return self.cb
+
+
+class PlaybookRunner:
+    def __init__(
+            self, inventory, playbook, project_dir='/tmp/', callback=None, extra_vars=None,
+            safety_mode=None, inventory_safety=None,
+    ):
+
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.playbook = playbook
+        self.project_dir = project_dir
+        if not callback:
+            callback = DefaultCallback()
+        self.cb = callback
+        self.isolate = True
+        self.envs = {}
+        if extra_vars is None:
+            extra_vars = {}
+        self.extra_vars = extra_vars
+        self.safety_mode = safety_mode
+        self.inventory_safety = inventory_safety
+
+    def copy_playbook(self):
+        entry = os.path.basename(self.playbook)
+        playbook_dir = os.path.dirname(self.playbook)
+        project_playbook_dir = os.path.join(self.project_dir, "project")
+        if os.path.realpath(playbook_dir) != os.path.realpath(project_playbook_dir):
+            shutil.copytree(playbook_dir, project_playbook_dir, dirs_exist_ok=True)
+        self.playbook = entry
+
+    def prepare_safe_inputs(self):
+        # Security anchor:
+        # For system-generated Ansible inputs that may contain user-controlled values,
+        # callers should explicitly enable safety_mode / inventory_safety so the runner
+        # sanitizes the task-private playbook / inventory before Ansible runs.
+        # This is intended for system-generated inputs whose values should be treated as
+        # literal data, not for arbitrary user-authored playbooks or execution logic.
+        if self.safety_mode == "playbook_unsafe":
+            project_playbook = os.path.join(self.project_dir, "project", self.playbook)
+            sanitize_ansible_playbook(project_playbook, project_playbook)
+            os.chmod(project_playbook, 0o600)
+
+        if self.inventory_safety == "json_escape":
+            sanitize_ansible_inventory_json(self.inventory, self.inventory)
+            os.chmod(self.inventory, 0o600)
+    @property
+    def playbook_project_dir(self):
+        return os.path.join(self.project_dir, 'project')
+
+    def run(self, verbosity=0, **kwargs):
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755)
+        self.copy_playbook()
+        self.prepare_safe_inputs()
+
+        verbosity = get_ansible_log_verbosity(verbosity)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
+
+        prepare_isolated_ansible_cfg(self.project_dir)
+        inventory = stage_inventory_for_docker(self.project_dir, self.inventory)
+
+        kwargs = dict(kwargs)
+        if use_ansible_docker_isolation():
+            kwargs.update(docker_isolation_kwargs(self.project_dir))
+            ensure_ansible_docker_image()
+        elif self.isolate and not is_macos():
+            kwargs['process_isolation'] = True
+            kwargs['process_isolation_executable'] = 'bwrap'
+
+        interface.run(
+            private_data_dir=self.project_dir,
+            inventory=inventory,
+            playbook=self.playbook,
+            verbosity=verbosity,
+            event_handler=self.cb.event_handler,
+            status_handler=self.cb.status_handler,
+            # Docker EE workdir must be the staged playbook dir (not private_data_dir root).
+            host_cwd=self.playbook_project_dir,
+            envvars=self.envs,
+            extravars=docker_extravars(self.extra_vars),
+            **kwargs
         )
+        return self.cb
 
-    @staticmethod
-    def check_module_args(module_name, module_args=''):
-        if module_name in C.MODULE_REQUIRE_ARGS and not module_args:
-            err = "No argument passed to '%s' module." % module_name
-            raise AnsibleError(err)
 
-    def check_pattern(self, pattern):
-        if not pattern:
-            raise AnsibleError("Pattern `{}` is not valid!".format(pattern))
-        if not self.inventory.list_hosts("all"):
-            raise AnsibleError("Inventory is empty.")
-        if not self.inventory.list_hosts(pattern):
-            raise AnsibleError(
-                "pattern: %s  dose not match any hosts." % pattern
-            )
+class SuperPlaybookRunner(PlaybookRunner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.envs = {"ANSIBLE_SUPER_MODE": "1"}
+        self.isolate = False
 
-    def clean_tasks(self, tasks):
-        cleaned_tasks = []
-        for task in tasks:
-            self.check_module_args(task['action']['module'], task['action'].get('args'))
-            cleaned_tasks.append(task)
-        return cleaned_tasks
 
-    def set_option(self, k, v):
-        kwargs = {k: v}
-        self.options = self.options._replace(**kwargs)
+class UploadFileRunner:
+    UPLOAD_STAGING_DIR = 'upload'
 
-    def run(self, tasks, pattern, play_name='Ansible Ad-hoc', gather_facts='no'):
-        """
-        :param tasks: [{'action': {'module': 'shell', 'args': 'ls'}, ...}, ]
-        :param pattern: all, *, or others
-        :param play_name: The play name
-        :return:
-        """
-        self.check_pattern(pattern)
-        results_callback = self.results_callback_class()
-        cleaned_tasks = self.clean_tasks(tasks)
+    def __init__(self, inventory, project_dir, job_id, dest_path, callback=None):
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.project_dir = project_dir
+        self.cb = DefaultCallback()
+        upload_file_dir = safe_join(settings.SHARE_DIR, 'job_upload_file')
+        self.share_src_dir = safe_join(upload_file_dir, str(job_id))
+        self.dest_path = safe_join("/tmp", dest_path)
 
-        play_source = dict(
-            name=play_name,
-            hosts=pattern,
-            gather_facts=gather_facts,
-            tasks=cleaned_tasks
-        )
+    def stage_upload_files(self):
+        """Copy uploads into private_data_dir so Docker EE can read src for copy."""
+        if not os.path.isdir(self.share_src_dir):
+            raise FileNotFoundError(f'Upload source directory not found: {self.share_src_dir}')
+        staged_dir = os.path.join(self.project_dir, self.UPLOAD_STAGING_DIR)
+        if os.path.exists(staged_dir):
+            shutil.rmtree(staged_dir)
+        shutil.copytree(self.share_src_dir, staged_dir)
+        return staged_dir
 
-        play = Play().load(
-            play_source,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-        )
+    def run(self, verbosity=0, **kwargs):
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755, exist_ok=True)
 
-        tqm = TaskQueueManager(
-            inventory=self.inventory,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-            options=self.options,
-            stdout_callback=results_callback,
-            passwords=self.options.passwords,
-        )
-        logger.debug("Get inventory matched hosts: {}".format(
-            self.inventory.get_matched_hosts(pattern)
-        ))
+        prepare_isolated_ansible_cfg(self.project_dir)
+        src_path = self.stage_upload_files()
 
+        verbosity = get_ansible_log_verbosity(verbosity)
+        run_kwargs = {
+            'private_data_dir': self.project_dir,
+            'host_pattern': "*",
+            'inventory': self.inventory,
+            'module': 'copy',
+            'module_args': f"src={src_path}/ dest={self.dest_path}/",
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            'host_cwd': self.project_dir,
+            **kwargs,
+        }
+        if use_ansible_docker_isolation():
+            run_kwargs.update(docker_isolation_kwargs(self.project_dir))
+            ensure_ansible_docker_image()
+        interface.run(**run_kwargs)
         try:
-            tqm.run(play)
-            return results_callback
-        except Exception as e:
-            raise AnsibleError(e)
-        finally:
-            tqm.cleanup()
-            self.loader.cleanup_all_tmp_files()
-
-
-class CommandRunner(AdHocRunner):
-    results_callback_class = CommandResultCallback
-    modules_choices = ('shell', 'raw', 'command', 'script')
-
-    def execute(self, cmd, pattern, module=None):
-        if module and module not in self.modules_choices:
-            raise AnsibleError("Module should in {}".format(self.modules_choices))
-        else:
-            module = "shell"
-
-        tasks = [
-            {"action": {"module": module, "args": cmd}}
-        ]
-        hosts = self.inventory.get_hosts(pattern=pattern)
-        name = "Run command {} on {}".format(cmd, ", ".join([host.name for host in hosts]))
-        return self.run(tasks, pattern, play_name=name)
-
+            shutil.rmtree(self.share_src_dir)
+        except OSError as e:
+            print(f"del upload tmp dir {self.share_src_dir} failed! {e}")
+        return self.cb

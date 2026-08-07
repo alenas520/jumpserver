@@ -2,7 +2,11 @@
 #
 
 from .asset import *
-from .admin_user import *
-from .label import *
-from .system_user import *
+from .automations import *
+from .cagegory import *
+from .domain import *
+from .favorite_asset import *
+from .gateway import *
 from .node import *
+from .platform import *
+from .my_asset import *

@@ -1,199 +1,235 @@
-# ~*~ coding: utf-8 ~*~
+import os
+from collections import defaultdict
+from functools import reduce
 
-from ansible.plugins.callback import CallbackBase
-from ansible.plugins.callback.default import CallbackModule
-
-
-class AdHocResultCallback(CallbackModule):
-    """
-    Task result Callback
-    """
-    def __init__(self, display=None, options=None):
-        # result_raw example: {
-        #   "ok": {"hostname": {"task_name": {}，...},..},
-        #   "failed": {"hostname": {"task_name": {}..}, ..},
-        #   "unreachable: {"hostname": {"task_name": {}, ..}},
-        #   "skipped": {"hostname": {"task_name": {}, ..}, ..},
-        # }
-        # results_summary example: {
-        #   "contacted": {"hostname",...},
-        #   "dark": {"hostname": {"task_name": {}, "task_name": {}},...,},
-        # }
-        self.results_raw = dict(ok={}, failed={}, unreachable={}, skipped={})
-        self.results_summary = dict(contacted=[], dark={})
-        super().__init__()
-
-    def gather_result(self, t, res):
-        self._clean_results(res._result, res._task.action)
-        host = res._host.get_name()
-        task_name = res.task_name
-        task_result = res._result
-
-        if self.results_raw[t].get(host):
-            self.results_raw[t][host][task_name] = task_result
-        else:
-            self.results_raw[t][host] = {task_name: task_result}
-        self.clean_result(t, host, task_name, task_result)
-
-    def clean_result(self, t, host, task_name, task_result):
-        contacted = self.results_summary["contacted"]
-        dark = self.results_summary["dark"]
-        if t in ("ok", "skipped") and host not in dark:
-            if host not in contacted:
-                contacted.append(host)
-        else:
-            if dark.get(host):
-                dark[host][task_name] = task_result.values
-            else:
-                dark[host] = {task_name: task_result}
-            if host in contacted:
-                contacted.remove(host)
-
-    def v2_runner_on_failed(self, result, ignore_errors=False):
-        self.gather_result("failed", result)
-        super().v2_runner_on_failed(result, ignore_errors=ignore_errors)
-
-    def v2_runner_on_ok(self, result):
-        self.gather_result("ok", result)
-        super().v2_runner_on_ok(result)
-
-    def v2_runner_on_skipped(self, result):
-        self.gather_result("skipped", result)
-        super().v2_runner_on_skipped(result)
-
-    def v2_runner_on_unreachable(self, result):
-        self.gather_result("unreachable", result)
-        super().v2_runner_on_unreachable(result)
+from django.conf import settings
 
 
-class CommandResultCallback(AdHocResultCallback):
-    """
-    Command result callback
-    """
-    def __init__(self, display=None):
-        # results_command: {
-        #   "cmd": "",
-        #   "stderr": "",
-        #   "stdout": "",
-        #   "rc": 0,
-        #   "delta": 0:0:0.123
-        # }
-        #
-        self.results_command = dict()
-        super().__init__(display)
+class DefaultCallback:
+    STATUS_MAPPER = {
+        "successful": "success",
+        "failure": "failed",
+        "failed": "failed",
+        "running": "running",
+        "pending": "pending",
+        "timeout": "timeout",
+        "unknown": "unknown",
+    }
 
-    def gather_result(self, t, res):
-        super().gather_result(t, res)
-        self.gather_cmd(t, res)
+    def __init__(self):
+        self.result = dict(
+            ok=defaultdict(dict),
+            failures=defaultdict(dict),
+            dark=defaultdict(dict),
+            skipped=defaultdict(dict),
+            ignored=defaultdict(dict),
+        )
+        self.summary = dict(
+            ok=[],
+            failures={},
+            dark={},
+            skipped=[],
+        )
+        self.status = "running"
+        self.finished = False
+        self.local_pid = 0
+        self.private_data_dir = None
 
-    def gather_cmd(self, t, res):
-        host = res._host.get_name()
-        cmd = {}
-        if t == "ok":
-            cmd['cmd'] = res._result.get('cmd')
-            cmd['stderr'] = res._result.get('stderr')
-            cmd['stdout'] = res._result.get('stdout')
-            cmd['rc'] = res._result.get('rc')
-            cmd['delta'] = res._result.get('delta')
-        else:
-            cmd['err'] = "Error: {}".format(res)
-        self.results_command[host] = cmd
+    @property
+    def host_results(self):
+        results = defaultdict(dict)
+        for state, hosts in self.result.items():
+            for host, items in hosts.items():
+                results[host][state] = items
+        return results
 
+    def is_success(self):
+        return self.status != "success"
 
-class PlaybookResultCallBack(CallbackBase):
-    """
-    Custom callback model for handlering the output data of
-    execute playbook file,
-    Base on the build-in callback plugins of ansible which named `json`.
-    """
+    def event_handler(self, data, **kwargs):
+        event = data.get("event", None)
+        if not event:
+            return
 
-    CALLBACK_VERSION = 2.0
-    CALLBACK_TYPE = 'stdout'
-    CALLBACK_NAME = 'Dict'
+        pid = data.get("pid", None)
+        if pid:
+            self.write_pid(pid)
 
-    def __init__(self, display=None):
-        super(PlaybookResultCallBack, self).__init__(display)
-        self.results = []
-        self.output = ""
-        self.item_results = {}  # {"host": []}
+        event_data = data.get("event_data", {})
+        host = event_data.get("remote_addr", "")
+        task = event_data.get("task", "")
+        res = event_data.get("res", {})
+        handler = getattr(self, event, self.on_any)
+        handler(event_data, host=host, task=task, res=res)
 
-    def _new_play(self, play):
-        return {
-            'play': {
-                'name': play.name,
-                'id': str(play._uuid)
-            },
-            'tasks': []
+    def runner_on_ok(self, event_data, host=None, task=None, res=None):
+        detail = {
+            "action": event_data.get("task_action", ""),
+            "res": res,
+            "rc": res.get("rc", 0),
+            "stdout": res.get("stdout", ""),
         }
+        self.result["ok"][host][task] = detail
 
-    def _new_task(self, task):
-        return {
-            'task': {
-                'name': task.get_name(),
-            },
-            'hosts': {}
+    def runner_on_skipped(self, event_data, host=None, task=None, **kwargs):
+        detail = {
+            "action": event_data.get("task_action", ""),
+            "res": {},
+            "rc": 0,
         }
+        self.result["skipped"][host][task] = detail
 
-    def v2_playbook_on_no_hosts_matched(self):
-        self.output = "skipping: No match hosts."
+    def runner_on_failed(self, event_data, host=None, task=None, res=None, **kwargs):
+        detail = {
+            "action": event_data.get("task_action", ""),
+            "res": res,
+            "rc": res.get("rc", 0),
+            "stdout": res.get("stdout", ""),
+            "stderr": ";".join([res.get("stderr", ""), res.get("msg", "")]).strip(";"),
+        }
+        ignore_errors = event_data.get("ignore_errors", False)
+        error_key = "ignored" if ignore_errors else "failures"
+        self.result[error_key][host][task] = detail
 
-    def v2_playbook_on_no_hosts_remaining(self):
+    def runner_on_unreachable(
+            self, event_data, host=None, task=None, res=None, **kwargs
+    ):
+        detail = {
+            "action": event_data.get("task_action", ""),
+            "res": res,
+            "rc": 255,
+            "stderr": ";".join([res.get("stderr", ""), res.get("msg", "")]).strip(";"),
+        }
+        ignore_unreachable = event_data.get("ignore_unreachable", False)
+        if not ignore_unreachable:
+            ignore_unreachable = self._task_path_ignores_unreachable(
+                event_data.get("task_path", "")
+            )
+        error_key = "ignored" if ignore_unreachable else "dark"
+        self.result[error_key][host][task] = detail
+
+    @staticmethod
+    def _task_path_ignores_unreachable(task_path):
+        if not task_path or ":" not in task_path:
+            return False
+
+        path, line_str = task_path.rsplit(":", 1)
+        try:
+            line_no = int(line_str)
+        except ValueError:
+            return False
+
+        try:
+            with open(path, "r") as f:
+                lines = f.readlines()
+        except OSError:
+            return False
+
+        line_no = max(1, min(line_no, len(lines)))
+
+        def is_task_start(line):
+            stripped = line.lstrip(" \t")
+            return stripped.startswith("- ")
+
+        start_idx = None
+        start_indent = 0
+        for idx in range(line_no - 1, -1, -1):
+            if is_task_start(lines[idx]):
+                start_idx = idx
+                start_indent = len(lines[idx]) - len(lines[idx].lstrip(" \t"))
+                break
+
+        if start_idx is None:
+            return False
+
+        for line in lines[start_idx + 1:]:
+            stripped = line.lstrip(" \t")
+            if stripped.startswith("- "):
+                curr_indent = len(line) - len(stripped)
+                if curr_indent <= start_indent:
+                    break
+            if "ignore_unreachable:" in line:
+                return True
+
+        return False
+
+    def runner_on_start(self, event_data, **kwargs):
         pass
 
-    def v2_playbook_on_task_start(self, task, is_conditional):
-        self.results[-1]['tasks'].append(self._new_task(task))
+    def runner_retry(self, event_data, **kwargs):
+        pass
 
-    def v2_playbook_on_play_start(self, play):
-        self.results.append(self._new_play(play))
+    def runner_on_file_diff(self, event_data, **kwargs):
+        pass
 
-    def v2_playbook_on_stats(self, stats):
-        hosts = sorted(stats.processed.keys())
-        summary = {}
-        for h in hosts:
-            s = stats.summarize(h)
-            summary[h] = s
+    def runner_item_on_failed(self, event_data, **kwargs):
+        pass
 
-        if self.output:
-            pass
-        else:
-            self.output = {
-                'plays': self.results,
-                'stats': summary
-            }
+    def runner_item_on_skipped(self, event_data, **kwargs):
+        pass
 
-    def gather_result(self, res):
-        if res._task.loop and "results" in res._result and res._host.name in self.item_results:
-            res._result.update({"results": self.item_results[res._host.name]})
-            del self.item_results[res._host.name]
+    def playbook_on_play_start(self, event_data, **kwargs):
+        pass
 
-        self.results[-1]['tasks'][-1]['hosts'][res._host.name] = res._result
+    def playbook_on_stats(self, event_data, **kwargs):
+        error_func = (
+            lambda err, task_detail: err
+                                     + f"{task_detail[0]}: {task_detail[1]['stderr']};"
+        )
+        for tp in ["dark", "failures"]:
+            for host, tasks in self.result[tp].items():
+                error = reduce(error_func, tasks.items(), "").strip(";")
+                self.summary[tp][host] = error
+        failures = list(self.result["failures"].keys())
+        dark_or_failures = list(self.result["dark"].keys()) + failures
 
-    def v2_runner_on_ok(self, res, **kwargs):
-        if "ansible_facts" in res._result:
-            del res._result["ansible_facts"]
+        for host, tasks in self.result.get("ignored", {}).items():
+            ignore_errors = reduce(error_func, tasks.items(), "").strip(";")
+            if host in failures:
+                self.summary["failures"][host] += ignore_errors
 
-        self.gather_result(res)
+        self.summary["ok"] = list(set(self.result["ok"].keys()) - set(dark_or_failures))
+        self.summary["skipped"] = list(
+            set(self.result["skipped"].keys()) - set(dark_or_failures)
+        )
 
-    def v2_runner_on_failed(self, res, **kwargs):
-        self.gather_result(res)
+    def playbook_on_include(self, event_data, **kwargs):
+        pass
 
-    def v2_runner_on_unreachable(self, res, **kwargs):
-        self.gather_result(res)
+    def playbook_on_notify(self, event_data, **kwargs):
+        pass
 
-    def v2_runner_on_skipped(self, res, **kwargs):
-        self.gather_result(res)
+    def playbook_on_vars_prompt(self, event_data, **kwargs):
+        pass
 
-    def gather_item_result(self, res):
-        self.item_results.setdefault(res._host.name, []).append(res._result)
+    def playbook_on_handler_task_start(self, event_data, **kwargs):
+        pass
 
-    def v2_runner_item_on_ok(self, res):
-        self.gather_item_result(res)
+    def playbook_on_no_hosts_matched(self, event_data, **kwargs):
+        pass
 
-    def v2_runner_item_on_failed(self, res):
-        self.gather_item_result(res)
+    def playbook_on_no_hosts_remaining(self, event_data, **kwargs):
+        pass
 
-    def v2_runner_item_on_skipped(self, res):
-        self.gather_item_result(res)
+    def playbook_on_start(self, event_data, **kwargs):
+        if settings.DEBUG_DEV:
+            print("DEBUG: delete inventory: ", os.path.join(self.private_data_dir, 'inventory'))
+        inventory_path = os.path.join(self.private_data_dir, 'inventory', 'hosts')
+        if os.path.exists(inventory_path):
+            os.remove(inventory_path)
 
+    def warning(self, event_data, **kwargs):
+        pass
 
+    def on_any(self, event_data, **kwargs):
+        pass
 
+    def status_handler(self, data, **kwargs):
+        status = data.get("status", "")
+        self.status = self.STATUS_MAPPER.get(status, "unknown")
+        self.private_data_dir = data.get("private_data_dir", None)
+
+    def write_pid(self, pid):
+        pid_filepath = os.path.join(self.private_data_dir, "local.pid")
+        with open(pid_filepath, "w") as f:
+            f.write(str(pid))

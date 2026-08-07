@@ -1,38 +1,58 @@
 # -*- coding: utf-8 -*-
 #
+from datetime import datetime
 
-from jms_es_sdk import ESStore
-from .base import CommandBase
+import pytz
+
+from common.plugins.es import ES
+from common.utils import get_logger
+
+logger = get_logger(__file__)
 
 
-class CommandStore(CommandBase, ESStore):
-    def __init__(self, params):
-        hosts = params.get('HOSTS', ['http://localhost'])
-        ESStore.__init__(self, hosts=hosts)
+class CommandStore(ES):
+    def __init__(self, config):
+        properties = {
+            "session": {
+                "type": "keyword"
+            },
+            "org_id": {
+                "type": "keyword"
+            },
+            "@timestamp": {
+                "type": "date"
+            },
+            "timestamp": {
+                "type": "long"
+            }
+        }
+        exact_fields = {'risk_level'}
+        fuzzy_fields = {'input', 'user', 'asset', 'account'}
+        match_fields = {'input'}
+        keyword_fields = {'session', 'org_id'}
 
-    def save(self, command):
-        return ESStore.save(self, command)
+        super().__init__(config, properties, keyword_fields, exact_fields, fuzzy_fields, match_fields)
 
-    def bulk_save(self, commands):
-        return ESStore.bulk_save(self, commands)
-
-    def filter(self, date_from=None, date_to=None,
-               user=None, asset=None, system_user=None,
-               input=None, session=None):
-
-        data = ESStore.filter(
-            self, date_from=date_from, date_to=date_to,
-            user=user, asset=asset, system_user=system_user,
-            input=input, session=session
+    @staticmethod
+    def make_data(command):
+        data = dict(
+            user=command["user"], asset=command["asset"],
+            account=command["account"], input=command["input"],
+            output=command["output"], risk_level=command["risk_level"],
+            session=command["session"], timestamp=command["timestamp"],
+            org_id=command["org_id"]
         )
-        return [item["_source"] for item in data["hits"] if item]
+        data["date"] = datetime.fromtimestamp(command['timestamp'], tz=pytz.UTC)
+        return data
 
-    def count(self, date_from=None, date_to=None,
-               user=None, asset=None, system_user=None,
-               input=None, session=None):
-        amount = ESStore.count(
-            self, date_from=date_from, date_to=date_to,
-            user=user, asset=asset, system_user=system_user,
-            input=input, session=session
-        )
-        return amount
+    @staticmethod
+    def handler_time_field(data):
+        timestamp__gte = data.get('timestamp__gte')
+        timestamp__lte = data.get('timestamp__lte')
+        timestamp_range = {}
+
+        if timestamp__gte:
+            timestamp_range['gte'] = timestamp__gte
+        if timestamp__lte:
+            timestamp_range['lte'] = timestamp__lte
+        return 'timestamp', timestamp_range
